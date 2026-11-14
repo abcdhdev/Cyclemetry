@@ -11,7 +11,11 @@
   import PlaybackControls from '../canvas/PlaybackControls.svelte'
   import RiderWeightPrompt from '../ui/RiderWeightPrompt.svelte'
   import VideoAlignmentBar from '../canvas/VideoAlignmentBar.svelte'
-  import { videoStartOnAxis } from '@/lib/videoAlignment.js'
+  import {
+    activeVideoAt,
+    playableVideos,
+    videoStartOnAxis,
+  } from '@/lib/videoAlignment.js'
   import { isLapMetric } from '@/lib/elementTypes.js'
   import * as backend from '@/api/backend.js'
   import { Github } from 'lucide-svelte'
@@ -337,13 +341,12 @@
   let videoIsMaster = $derived.by(() => {
     if (!playing) return false
     if (!app.videoUnderlayVisible) return false
-    const v = app.video
-    if (!v || v.missing || !(v.duration > 0)) return false
+    const v = activeVideoAt(app.gpxStartTime, app.videos, app.selectedSecond)
+    if (!v) return false
+    // Hand the clock back just before the clip ends, so a clip running out
+    // can never freeze the playhead.
     const startAbs = videoStartOnAxis(app.gpxStartTime, v)
-    return (
-      app.selectedSecond >= startAbs &&
-      app.selectedSecond <= startAbs + v.duration
-    )
+    return app.selectedSecond < startAbs + v.duration - 0.05
   })
 
   function tick(now) {
@@ -1216,7 +1219,7 @@
   </div>
 
   <!-- Video alignment bar — always shown when a valid video is loaded -->
-  {#if app.config && app.hasActivity && app.video && !app.video.missing}
+  {#if app.config && app.hasActivity && playableVideos(app.videos).length > 0}
     <VideoAlignmentBar />
   {/if}
 

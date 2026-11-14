@@ -273,6 +273,18 @@ export const getActivityMetricRange = (
  */
 export const probeVideo = (path) => invoke('probe_video', { path })
 
+/**
+ * Motion auto-sync: find the clock offset that lines the clips' GoPro
+ * accelerometer vibration up with the activity's speed.
+ * @param {string} gpxFilename
+ * @param {{ path: string, start_sec: number }[]} clips current placements
+ * @returns {Promise<{ offset_sec: number, correlation: number, runner_up: number,
+ *   bins_used: number, confidence: 'high'|'medium'|'low',
+ *   clips_used: string[], clips_skipped: string[] }>}
+ */
+export const autoSyncVideos = (gpxFilename, clips) =>
+  invoke('auto_sync_videos', { gpxFilename, clips })
+
 /** @returns {Promise<string>} HTTP URL for streaming the video file */
 export const videoSrcUrl = (path) => invoke('video_src_url', { path })
 
@@ -447,6 +459,15 @@ export const nativeStartRender = (
     exportFormat: exportFormat ?? null,
     stitchVideoPath: stitch?.videoPath ?? null,
     stitchVideoIn: stitch?.videoIn ?? null,
+    // Multi-clip stitched export: [{ video_path, video_in, start, end }]
+    stitchSegments: stitch?.segments?.length
+      ? stitch.segments.map((s) => ({
+          video_path: s.videoPath,
+          video_in: s.videoIn,
+          start: s.start,
+          end: s.end,
+        }))
+      : null,
     fullFrame: fullFrame ?? false,
     riderWeightKg: riderWeightKg ?? null,
   })

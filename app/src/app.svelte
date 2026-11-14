@@ -23,23 +23,18 @@
   import NewTemplateDialog from './components/overlays/NewTemplateDialog.svelte'
   import ExportFormatDialog from './components/overlays/ExportFormatDialog.svelte'
   import Button from './components/ui/Button.svelte'
+  import VideoClipsMenu from './components/layout/VideoClipsMenu.svelte'
   import Tooltip from './components/ui/Tooltip.svelte'
 
   import {
     Activity,
-    AlertTriangle,
     ChevronDown,
-    Clock,
-    Eye,
-    EyeOff,
-    Film,
     LayoutGrid,
     Monitor,
     Play,
     RotateCcw,
     Save,
     Sparkles,
-    X,
   } from 'lucide-svelte'
   import {
     formatTime,
@@ -49,7 +44,11 @@
     DEFAULT_STITCHED_BITS_PER_PIXEL_SECOND,
     TOOLTIP_DELAY,
   } from './lib/utils.js'
-  import { wallClockDeltaSec } from './lib/videoAlignment.js'
+  import {
+    exportSegments,
+    playableVideos,
+    wallClockDeltaSec,
+  } from './lib/videoAlignment.js'
 
   // ── State ──────────────────────────────────────────────────────────────────
   const app = createAppState()
@@ -81,7 +80,8 @@
   // reference video for a finished, shareable MP4. The stitched option only
   // appears once a video is loaded — with no footage there's nothing to burn
   // onto, so offering it would just dead-end into a file picker.
-  let hasVideoLoaded = $derived(!!app.video?.path && !app.video.missing)
+  let playable = $derived(playableVideos(app.videos))
+  let hasVideoLoaded = $derived(playable.length > 0)
   let EXPORT_FORMATS = $derived([
     {
       value: 'prores',
@@ -110,7 +110,10 @@
             transparent: false,
             bestFor: 'Sharing',
             summary: 'Overlay burned onto your video — ready to share.',
-            desc: `Burns the overlay directly onto ${videoBasename(app.video.path)} — a finished video, ready to share. No editor needed.`,
+            desc:
+              playable.length === 1
+                ? `Burns the overlay directly onto ${videoBasename(playable[0].path)} — a finished video, ready to share. No editor needed.`
+                : `Burns the overlay onto your ${playable.length} clips and joins the included ones back to back into one video — ready to share. No editor needed.`,
           },
         ]
       : []),
@@ -151,19 +154,28 @@
   // band somewhere useless. Common causes: re-encoded/stitched exports carry
   // the export time, or the camera clock/timezone is wrong.
   function moveVideoToRecordingTime() {
-    const delta = wallClockDeltaSec(app.gpxStartTime, app.video)
-    if (delta == null) return
-    const videoEnd = delta + (app.video?.duration ?? 0)
-    if (videoEnd <= 0 || delta >= app.timelineDuration) {
-      const gap = videoEnd <= 0 ? videoEnd : delta - app.timelineDuration
+    const timed = app.videos.filter(
+      (v) => !v.missing && wallClockDeltaSec(app.gpxStartTime, v) != null,
+    )
+    if (timed.length === 0) return
+    const placements = timed.map((v) => {
+      const delta = wallClockDeltaSec(app.gpxStartTime, v)
+      return { v, delta, end: delta + (v.duration ?? 0) }
+    })
+    const inside = placements.some(
+      (p) => p.end > 0 && p.delta < app.timelineDuration,
+    )
+    if (!inside) {
+      const p = placements[0]
+      const gap = p.end <= 0 ? p.end : p.delta - app.timelineDuration
       app.errorMessage =
-        `Can't align: the video's recorded timestamp (${app.video.creationTime}) is ` +
-        `${humanGap(gap)} ${videoEnd <= 0 ? 'before the activity starts' : 'after the activity ends'}. ` +
+        `Can't align: the ${timed.length === 1 ? "video's recorded timestamp" : 'videos’ recorded timestamps'} (${p.v.creationTime}${timed.length === 1 ? '' : ', …'}) ` +
+        `${timed.length === 1 ? 'is' : 'are'} ${humanGap(gap)} ${p.end <= 0 ? 'before the activity starts' : 'after the activity ends'}. ` +
         `The file's creation time is probably not the recording time — stitched or re-encoded exports ` +
-        `carry the export time, and a wrong camera clock or timezone shifts it. Drag the video band to align manually.`
+        `carry the export time, and a wrong camera clock or timezone shifts it. Try Auto-sync, or drag the videos to align manually.`
       return
     }
-    app.setVideoOffset(0)
+    app.alignVideosToRecordingTime()
   }
 
   function errorText(err, fallback = 'Unknown error') {
@@ -177,13 +189,6 @@
     customResActive = false
     showResolutionMenu = false
   }
-
-  // Offer the align button whenever both timestamps exist — even when the
-  // wall-clock placement would land outside the activity, so pressing it can
-  // explain the metadata problem instead of the button silently vanishing.
-  let canUseRecordingTime = $derived(
-    app.hasActivity && wallClockDeltaSec(app.gpxStartTime, app.video) != null,
-  )
 
   // ── Template toolbar helpers ───────────────────────────────────────────────
   let templateLabel = $derived.by(() => {
@@ -533,10 +538,10 @@
   async function startRender(format, fullFrame = false) {
     showExportFormatDialog = false
     if (rendering || !app.hasActivity) return
-    if (format === 'stitched' && (!app.video?.path || app.video.missing)) {
+    if (format === 'stitched' && !hasVideoLoaded) {
       // Stitching needs footage — pick it now; bail if the user cancels.
       await app.pickAndLoadVideo()
-      if (!app.video?.path || app.video.missing) return
+      if (playableVideos(app.videos).length === 0) return
     }
     app.exportFormat = format
     // Only the transparent formats carry a sizing choice — don't let a stitched
@@ -572,13 +577,17 @@
   // Output video length in seconds for a given format. A time-lapse
   // (scene.target_duration) compresses the whole window into that many seconds;
   // stitched exports ignore it (the footage can't be sped up to match, mirroring
-  // the Rust guard), so they use the real window length.
+  // the Rust guard) and only cover the included clips, back to back.
   function outputDurationFor(format) {
     const start = app.config.scene.start ?? 0
     const end = app.config.scene.end ?? app.timelineDuration
-    const window = end - start
+    if (format === 'stitched')
+      return exportSegments(app.gpxStartTime, app.videos, start, end).reduce(
+        (sum, s) => sum + (s.end - s.start),
+        0,
+      )
     const td = app.config.scene.target_duration
-    return format !== 'stitched' && td > 0 ? td : window
+    return td > 0 ? td : end - start
   }
 
   function renderEstimateSecsFor(format) {
@@ -889,97 +898,9 @@
       </button>
     </Tooltip>
 
-    <!-- Video — always shown, dashed border signals optional -->
+    <!-- Videos — always shown, dashed border signals optional -->
     <div class="h-5 w-px bg-white/[0.07] shrink-0"></div>
-    {#if !app.video}
-      <Tooltip
-        content="Adding video is only for preview. The exported overlay will not include the video."
-        side="bottom"
-        class="shrink-0"
-      >
-        <button
-          onclick={() => app.pickAndLoadVideo()}
-          class="hdr-btn px-2.5 gap-1.5 border-dashed border-[var(--panel3)] bg-transparent hover:bg-[var(--panel2)]"
-        >
-          <Film size={12} class="shrink-0" />
-          Add video…
-        </button>
-      </Tooltip>
-    {:else if app.video.missing}
-      <div class="flex items-center gap-1 shrink-0">
-        <Tooltip
-          content="Locate replacement video"
-          side="bottom"
-          delay={TOOLTIP_DELAY}
-        >
-          <button
-            onclick={() => app.pickAndLoadVideo()}
-            class="hdr-btn px-2.5 gap-1.5 max-w-[160px] border-red-800/60 text-red-300 hover:border-red-600/60 hover:bg-red-900/30 hover:text-red-200"
-            title={app.video.path}
-          >
-            <AlertTriangle size={12} class="text-red-400 shrink-0" />
-            <span class="truncate">{videoBasename(app.video.path)}</span>
-          </button>
-        </Tooltip>
-        <button
-          onclick={() => app.clearVideo()}
-          class="hdr-btn hdr-btn-icon shrink-0"><X size={12} /></button
-        >
-      </div>
-    {:else}
-      <div class="flex items-center gap-1 shrink-0">
-        <Tooltip content="Replace video" side="bottom" delay={TOOLTIP_DELAY}>
-          <button
-            onclick={() => app.pickAndLoadVideo()}
-            class="hdr-btn px-2.5 gap-1.5 max-w-[170px]"
-            title={app.video.path}
-          >
-            <Film size={12} class="text-zinc-500 shrink-0" />
-            <span class="truncate text-zinc-200"
-              >{videoBasename(app.video.path)}</span
-            >
-          </button>
-        </Tooltip>
-        {#if canUseRecordingTime}
-          <button
-            onclick={moveVideoToRecordingTime}
-            title={app.video.creationTimeNote
-              ? `Align to camera recording time — ${app.video.creationTimeNote}`
-              : 'Align to camera recording time'}
-            class="hdr-btn hdr-btn-icon shrink-0"><Clock size={12} /></button
-          >
-        {/if}
-        <Tooltip
-          content={app.videoUnderlayVisible
-            ? 'Hide video underlay'
-            : 'Show video underlay'}
-          side="bottom"
-          delay={TOOLTIP_DELAY}
-        >
-          <button
-            onclick={() =>
-              app.setVideoUnderlayVisible(!app.videoUnderlayVisible)}
-            class="hdr-btn hdr-btn-icon hdr-btn-ghost shrink-0 {app.videoUnderlayVisible
-              ? ''
-              : 'text-[var(--dim)]'}"
-            aria-label={app.videoUnderlayVisible
-              ? 'Hide video underlay'
-              : 'Show video underlay'}
-            aria-pressed={app.videoUnderlayVisible}
-          >
-            {#if app.videoUnderlayVisible}
-              <Eye size={12} />
-            {:else}
-              <EyeOff size={12} />
-            {/if}
-          </button>
-        </Tooltip>
-        <button
-          onclick={() => app.clearVideo()}
-          class="hdr-btn hdr-btn-icon shrink-0"><X size={12} /></button
-        >
-      </div>
-    {/if}
+    <VideoClipsMenu onalignrecordingtime={moveVideoToRecordingTime} />
 
     <!-- ── Scene toolbar: resolution + FPS (shown when a template is loaded) ── -->
     {#if app.config?.scene}

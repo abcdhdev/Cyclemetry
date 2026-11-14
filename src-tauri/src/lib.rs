@@ -1297,6 +1297,93 @@ async fn probe_video(path: String) -> Result<render::video::VideoProbe, String> 
         .map_err(|e| format!("Probe task join error: {e}"))?
 }
 
+// ─── Motion auto-sync ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AutoSyncClip {
+    path: String,
+    /// Where the clip's first frame currently sits on the activity axis
+    /// (seconds from the activity start). The frontend owns alignment, so it
+    /// passes the camera-clock placement it wants corrected.
+    start_sec: f64,
+}
+
+#[derive(Serialize)]
+struct AutoSyncResult {
+    #[serde(flatten)]
+    matched: render::motion_sync::OffsetMatch,
+    /// Clips whose accelerometer data took part in the match.
+    clips_used: Vec<String>,
+    /// Clips without a GoPro telemetry track (or unreadable) — left untouched.
+    clips_skipped: Vec<String>,
+}
+
+/// Find the single clock offset that aligns every clip's handlebar vibration
+/// with the activity's speed. See `render::motion_sync` for the method.
+#[tauri::command]
+async fn auto_sync_videos(
+    gpx_filename: String,
+    clips: Vec<AutoSyncClip>,
+) -> Result<AutoSyncResult, String> {
+    let (gpx_path, _) = resolve_gpx_path(&gpx_filename)?;
+    tokio::task::spawn_blocking(move || {
+        use render::motion_sync::{ClipMotion, bin_samples, extract_vibration, find_offset};
+        let activity = load_activity_cached(&gpx_path)
+            .map_err(|e| format!("Could not read activity file: {e}"))?;
+        let speed = render::motion_sync::speed_per_second(&activity);
+
+        let mut motions = Vec::new();
+        let mut clips_used = Vec::new();
+        let mut clips_skipped = Vec::new();
+        for clip in clips {
+            let samples = render::video::probe_raw(&clip.path).and_then(|p| {
+                match (p.gpmf_stream, p.duration) {
+                    (Some(stream), Some(duration)) => {
+                        extract_vibration(&clip.path, stream, duration).map(|s| (s, duration))
+                    }
+                    _ => Err("no GoPro telemetry track".to_string()),
+                }
+            });
+            match samples {
+                Ok((s, duration)) if !s.is_empty() => {
+                    motions.push(ClipMotion {
+                        start_sec: clip.start_sec,
+                        bins: bin_samples(&s, duration),
+                    });
+                    clips_used.push(clip.path);
+                }
+                Ok(_) => clips_skipped.push(clip.path),
+                Err(e) => {
+                    log::info!("auto_sync_videos: skipping {}: {e}", clip.path);
+                    clips_skipped.push(clip.path);
+                }
+            }
+        }
+        if motions.is_empty() {
+            return Err(
+                "None of the videos carry GoPro accelerometer telemetry, so they can't be synced by motion."
+                    .to_string(),
+            );
+        }
+        let matched = find_offset(&motions, &speed)?;
+        log::info!(
+            "auto_sync_videos: offset {:+.0}s r={:.3} runner-up={:.3} bins={} ({})",
+            matched.offset_sec,
+            matched.correlation,
+            matched.runner_up,
+            matched.bins_used,
+            matched.confidence
+        );
+        Ok(AutoSyncResult {
+            matched,
+            clips_used,
+            clips_skipped,
+        })
+    })
+    .await
+    .map_err(|e| format!("Auto-sync task failed: {e}"))?
+}
+
 // ─── Video streaming server ────────────────────────────────────────────────────
 //
 // WebKitGTK (Linux) does not reliably support the `asset://` custom protocol
@@ -2078,6 +2165,63 @@ impl NativeRenderState {
 
 type SharedRenderState = Arc<Mutex<NativeRenderState>>;
 
+/// One clip of a multi-clip stitched export, as sent by the frontend (which
+/// owns timeline alignment): footage in-point plus the activity window.
+#[derive(Deserialize, Debug)]
+struct StitchSegmentArg {
+    video_path: String,
+    video_in: f64,
+    start: f64,
+    end: f64,
+}
+
+/// Probe every clip of a multi-clip export and pick the common output frame
+/// rate — the one most of the clips already use, so most segments pass
+/// through without frame-rate conversion.
+async fn prepare_stitch_segments(
+    segs: Vec<StitchSegmentArg>,
+) -> Result<(Vec<render::scene::StitchSegment>, String), String> {
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(segs.len());
+        let mut rates: Vec<(String, usize)> = Vec::new();
+        for seg in segs {
+            if seg.end.is_nan() || seg.start.is_nan() || seg.end <= seg.start {
+                continue;
+            }
+            if !std::path::Path::new(&seg.video_path).exists() {
+                return Err(format!("Source video not found: {}", seg.video_path));
+            }
+            let probe = render::video::probe_raw(&seg.video_path)?;
+            if let Some(fps) = probe.fps {
+                match rates.iter_mut().find(|(r, _)| *r == fps) {
+                    Some((_, n)) => *n += 1,
+                    None => rates.push((fps, 1)),
+                }
+            }
+            out.push(render::scene::StitchSegment {
+                video_path: seg.video_path,
+                video_in: seg.video_in.max(0.0),
+                start: seg.start,
+                end: seg.end,
+                source_has_audio: probe.has_audio,
+            });
+        }
+        if out.is_empty() {
+            return Err("None of the videos overlap the export range.".to_string());
+        }
+        // Most common rate; ties go to the earliest clip's.
+        let fps = rates
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, (_, n))| (*n, std::cmp::Reverse(*i)))
+            .map(|(_, (r, _))| render::video::fps_rational(r))
+            .unwrap_or_else(|| "30".to_string());
+        Ok((out, fps))
+    })
+    .await
+    .map_err(|e| format!("Probe task join error: {e}"))?
+}
+
 #[tauri::command]
 async fn native_render(
     config: serde_json::Value,
@@ -2088,6 +2232,10 @@ async fn native_render(
     export_format: Option<String>,
     stitch_video_path: Option<String>,
     stitch_video_in: Option<f64>,
+    // Multi-clip stitched export: every clip overlapping the export window,
+    // in playback order. When given (2+ clips), replaces stitch_video_path /
+    // stitch_video_in and produces one MP4 with the clips back to back.
+    stitch_segments: Option<Vec<StitchSegmentArg>>,
     // Transparent overlay exports: when true, emit the full canvas (dead space
     // around the overlay) instead of cropping to the visible elements. Defaults
     // to false (crop + placement-offset sidecar). Ignored for stitched.
@@ -2113,8 +2261,15 @@ async fn native_render(
     let stitch = stitch_video_path.map(|video_path| render::scene::StitchOptions {
         video_path,
         video_in: stitch_video_in.unwrap_or(0.0),
+        segment: None,
     });
-    if export_format == render::scene::ExportFormat::Stitched {
+    let multi = match stitch_segments {
+        Some(segs) if segs.len() > 1 && export_format == render::scene::ExportFormat::Stitched => {
+            Some(prepare_stitch_segments(segs).await?)
+        }
+        _ => None,
+    };
+    if export_format == render::scene::ExportFormat::Stitched && multi.is_none() {
         match &stitch {
             None => return Err("Stitched export requires a source video".to_string()),
             Some(s) if !std::path::Path::new(&s.video_path).exists() => {
@@ -2174,6 +2329,18 @@ async fn native_render(
         // silently swallow the JoinHandle error and leave is_running=true forever.
         let assets_dirs: Vec<&str> = assets_dirs_owned.iter().map(String::as_str).collect();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some((segments, fps)) = &multi {
+                return render::scene::render_stitched_segments(
+                    &gpx_path,
+                    &template,
+                    segments,
+                    fps,
+                    &output_path,
+                    &fonts_dir,
+                    &assets_dirs,
+                    &progress_clone,
+                );
+            }
             render::scene::render_video(
                 &gpx_path,
                 &template,
@@ -2705,6 +2872,7 @@ pub fn run() {
             backend_dev_clear_cache,
             backend_upload,
             probe_video,
+            auto_sync_videos,
             video_src_url,
             backend_community_templates,
             backend_install_community_template,

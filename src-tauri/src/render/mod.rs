@@ -4,5 +4,6 @@
 // working (chart/color are internal to render-core).
 pub use render_core::{activity, frame, template, units};
 
+pub mod motion_sync;
 pub mod scene;
 pub mod video;

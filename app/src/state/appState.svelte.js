@@ -16,9 +16,30 @@ import {
 import { stripDefaults } from '../lib/stripDefaults.js'
 import { normalizeElementUpdates } from '../lib/templateSchema.js'
 import {
+  activeVideoAt,
   offsetForVideoStart,
+  sharedClockOffsetSec,
+  videoStartOnAxis,
   wallClockApplicable,
+  wallClockDeltaSec,
 } from '../lib/videoAlignment.js'
+
+let _videoSeq = 0
+function newVideoId() {
+  _videoSeq += 1
+  return `v${Date.now().toString(36)}${_videoSeq}`
+}
+
+// Reference videos, persisted as an array. Migrates the single-video
+// `projectVideo` key from earlier versions.
+function loadStoredVideos() {
+  const list = parseLocalStorage('projectVideos')
+  if (Array.isArray(list))
+    return list.filter((v) => v?.path).map((v) => ({ id: newVideoId(), ...v }))
+  const single = parseLocalStorage('projectVideo')
+  localStorage.removeItem('projectVideo')
+  return single?.path ? [{ id: newVideoId(), ...single }] : []
+}
 
 // Dev-only: if the reset button set this flag, wipe localStorage before any
 // state reads so the persist $effect can't race-restore the old values.
@@ -87,11 +108,15 @@ export function createAppState() {
   // without timestamps. Set by the GPX load flow; used by the alignment
   // timeline to position the video clip on the activity's real-time axis.
   let gpxStartTime = $state(localStorage.getItem('gpxStartTime') || null)
-  // Reference video for timeline alignment + (Phase 4) live overlay preview.
-  // Stored by absolute path — file stays in place on disk; we never copy it.
+  // Reference videos for timeline alignment, live preview and stitched export.
+  // Stored by absolute path — files stay in place on disk; we never copy.
+  // Per clip: `userOffsetSec` corrects the camera clock (clips from one camera
+  // normally share it), `excluded` leaves the clip out of stitched exports,
   // `missing: true` means the path persisted from a prior session but the file
   // is no longer there, so the UI can prompt for relink.
-  let video = $state(parseLocalStorage('projectVideo'))
+  let videos = $state(loadStoredVideos())
+  // True while a motion auto-sync is running.
+  let syncingVideos = $state(false)
   let videoUnderlayVisible = $state(
     localStorage.getItem('videoUnderlayVisible') !== 'false',
   )
@@ -231,8 +256,9 @@ export function createAppState() {
     else localStorage.removeItem('gpxFilename')
   })
   $effect(() => {
-    if (video) localStorage.setItem('projectVideo', JSON.stringify(video))
-    else localStorage.removeItem('projectVideo')
+    if (videos.length)
+      localStorage.setItem('projectVideos', JSON.stringify(videos))
+    else localStorage.removeItem('projectVideos')
   })
   $effect(() => {
     localStorage.setItem('videoUnderlayVisible', String(videoUnderlayVisible))
@@ -331,50 +357,86 @@ export function createAppState() {
     else run()
   }
 
-  // ── Reference video ──────────────────────────────────────────────────────
-  // Probe the file, capture container metadata, store by absolute path.
-  // The video stays where the user put it on disk; we never copy.
-  async function loadVideo(absolutePath) {
-    if (!absolutePath) return
-    try {
-      const probe = await backend.probeVideo(absolutePath)
-      // Normalize probe → in-memory shape before the wall-clock check, since
-      // the helper expects creationTime (camelCase) + duration on a single
-      // object.
-      const draft = {
-        path: probe.path,
-        duration: probe.duration,
-        creationTime: probe.creation_time,
-        creationTimeNote: probe.creation_time_note ?? null,
-        codec: probe.codec,
-        width: probe.width,
-        height: probe.height,
-        userOffsetSec: 0,
-        missing: false,
-      }
-      // Auto-align: if the camera's wall clock places the video inside the
-      // activity period, trust it (offset = 0); otherwise snap the video's
-      // first frame to the current overlay window start, so the user sees
-      // it immediately on the alignment bar.
-      const initialOffset = wallClockApplicable(
-        gpxStartTime,
-        draft,
-        activityDuration,
-      )
-        ? 0
-        : offsetForVideoStart(gpxStartTime, draft, config?.scene?.start ?? 0)
-      video = { ...draft, userOffsetSec: initialOffset }
-      videoUnderlayVisible = true
-      // Preview FPS is fully automatic — the render-throughput tuner manages it,
-      // so there's nothing to bump here when a video underlay loads.
-    } catch (e) {
-      errorMessage = `Could not read video: ${e?.message ?? e}`
+  // ── Reference videos ─────────────────────────────────────────────────────
+  // Probe each file, capture container metadata, store by absolute path.
+  // Videos stay where the user put them on disk; we never copy.
+  async function probeToClip(absolutePath) {
+    const probe = await backend.probeVideo(absolutePath)
+    return {
+      id: newVideoId(),
+      path: probe.path,
+      duration: probe.duration,
+      creationTime: probe.creation_time,
+      creationTimeNote: probe.creation_time_note ?? null,
+      codec: probe.codec,
+      width: probe.width,
+      height: probe.height,
+      hasMotionData: probe.gpmf_stream != null,
+      userOffsetSec: 0,
+      excluded: false,
+      missing: false,
     }
+  }
+
+  function sortVideos(list) {
+    return [...list].sort(
+      (a, b) =>
+        videoStartOnAxis(gpxStartTime, a) - videoStartOnAxis(gpxStartTime, b),
+    )
+  }
+
+  // Add one or more clips. Placement for each new clip:
+  // - Clips already placed by wall clock share a camera correction (e.g. after
+  //   auto-sync): a new timestamped clip inherits it, so a clip added later
+  //   lands consistently with its siblings.
+  // - Otherwise trust the camera clock when it puts the clip inside the
+  //   activity (offset = 0), else snap the clip's first frame to the overlay
+  //   window start so it shows up on the alignment bar.
+  async function loadVideos(absolutePaths) {
+    const paths = (absolutePaths ?? []).filter(Boolean)
+    if (paths.length === 0) return
+    const known = videos.map((v) => v.path)
+    const failures = []
+    const added = []
+    for (const path of paths) {
+      if (known.includes(path)) continue
+      try {
+        added.push(await probeToClip(path))
+        known.push(path)
+      } catch (e) {
+        failures.push(`${path.split(/[\\/]/).pop()}: ${e?.message ?? e}`)
+      }
+    }
+    const shared = sharedClockOffsetSec(videos)
+    const placed = added.map((clip) => {
+      let offset
+      if (shared != null && clip.creationTime) offset = shared
+      else if (wallClockApplicable(gpxStartTime, clip, activityDuration))
+        offset = 0
+      else
+        offset = offsetForVideoStart(
+          gpxStartTime,
+          clip,
+          config?.scene?.start ?? 0,
+        )
+      return { ...clip, userOffsetSec: offset }
+    })
+    if (placed.length) {
+      videos = sortVideos([...videos, ...placed])
+      videoUnderlayVisible = true
+    }
+    if (failures.length)
+      errorMessage = `Could not read ${failures.length === 1 ? 'video' : `${failures.length} videos`}: ${failures.join('; ')}`
+  }
+
+  // Back-compat single-file entry point (drag-and-drop, relink).
+  async function loadVideo(absolutePath) {
+    await loadVideos([absolutePath])
   }
 
   async function pickAndLoadVideo() {
     const selected = await open({
-      multiple: false,
+      multiple: true,
       filters: [
         {
           name: 'Video',
@@ -390,35 +452,160 @@ export function createAppState() {
           ]),
         },
       ],
-      title: 'Select reference video',
+      title: 'Select videos',
     })
     if (!selected) return
-    await loadVideo(selected)
+    await loadVideos(Array.isArray(selected) ? selected : [selected])
   }
 
-  function clearVideo() {
-    video = null
+  // Replace a missing clip's file, keeping its placement.
+  async function relinkVideo(id) {
+    const selected = await open({
+      multiple: false,
+      title: 'Locate video',
+    })
+    if (!selected) return
+    try {
+      const fresh = await probeToClip(selected)
+      videos = videos.map((v) =>
+        v.id === id
+          ? {
+              ...fresh,
+              id,
+              userOffsetSec: v.userOffsetSec,
+              excluded: v.excluded,
+            }
+          : v,
+      )
+    } catch (e) {
+      errorMessage = `Could not read video: ${e?.message ?? e}`
+    }
+  }
+
+  function removeVideo(id) {
+    videos = videos.filter((v) => v.id !== id)
+  }
+
+  function clearVideos() {
+    videos = []
+  }
+
+  function setVideoExcluded(id, excluded) {
+    videos = videos.map((v) => (v.id === id ? { ...v, excluded } : v))
   }
 
   function setVideoUnderlayVisible(visible) {
     videoUnderlayVisible = visible
   }
 
-  function setVideoOffset(seconds) {
-    if (!video) return
-    video = { ...video, userOffsetSec: seconds }
+  function setVideoOffset(id, seconds) {
+    videos = videos.map((v) =>
+      v.id === id ? { ...v, userOffsetSec: seconds } : v,
+    )
   }
 
-  // Mark the video missing if its file disappeared between sessions. Cheap
+  // Set several clips' offsets at once: { [id]: seconds }.
+  function setVideoOffsets(offsetsById) {
+    videos = videos.map((v) =>
+      v.id in offsetsById ? { ...v, userOffsetSec: offsetsById[v.id] } : v,
+    )
+  }
+
+  // Move every clip by the same amount — clips from one camera share its
+  // clock error, so they move together.
+  function shiftAllVideos(deltaSec) {
+    if (!deltaSec) return
+    videos = videos.map((v) => ({
+      ...v,
+      userOffsetSec: Math.round((v.userOffsetSec ?? 0) + deltaSec),
+    }))
+  }
+
+  // Place every timestamped clip exactly at its camera recording time.
+  function alignVideosToRecordingTime() {
+    videos = sortVideos(
+      videos.map((v) =>
+        wallClockDeltaSec(gpxStartTime, v) != null
+          ? { ...v, userOffsetSec: 0 }
+          : v,
+      ),
+    )
+  }
+
+  // Find the camera clock error from motion: GoPro accelerometer vibration vs
+  // activity speed (see src-tauri/src/render/motion_sync.rs). Applied to every
+  // clip that took part; a low-confidence match is reported, not applied.
+  async function autoSyncVideos() {
+    if (syncingVideos || !gpxFilename) return
+    const clips = videos
+      .filter((v) => !v.missing && v.path)
+      .map((v) => ({
+        path: v.path,
+        start_sec: videoStartOnAxis(gpxStartTime, v),
+      }))
+    if (clips.length === 0) return
+    syncingVideos = true
+    try {
+      const r = await backend.autoSyncVideos(gpxFilename, clips)
+      const shift = Math.round(r.offset_sec)
+      const used = r.clips_used ?? []
+      const label = `${shift < 0 ? '−' : '+'}${formatDuration(Math.abs(shift))}`
+      if (r.confidence === 'low') {
+        errorMessage =
+          `Auto-sync wasn't confident enough to apply (best match ${label}, ` +
+          `correlation ${r.correlation.toFixed(2)} vs ${r.runner_up.toFixed(2)} elsewhere). ` +
+          `Longer clips with stops and starts help — or drag the clips to align manually.`
+        return
+      }
+      videos = sortVideos(
+        videos.map((v) =>
+          used.includes(v.path)
+            ? {
+                ...v,
+                userOffsetSec: Math.round((v.userOffsetSec ?? 0) + shift),
+              }
+            : v,
+        ),
+      )
+      const skipped = r.clips_skipped?.length
+        ? ` ${r.clips_skipped.length} clip${r.clips_skipped.length === 1 ? '' : 's'} without motion data left as-is.`
+        : ''
+      showSuccess(
+        `Synced ${used.length} clip${used.length === 1 ? '' : 's'} by motion: moved ${label} (${r.confidence} confidence).${skipped}`,
+      )
+    } catch (e) {
+      errorMessage = `Auto-sync failed: ${e?.message ?? e}`
+    } finally {
+      syncingVideos = false
+    }
+  }
+
+  function formatDuration(sec) {
+    const h = Math.floor(sec / 3600)
+    const m = Math.floor((sec % 3600) / 60)
+    const s = sec % 60
+    return h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`
+  }
+
+  // Mark clips missing if their files disappeared between sessions. Cheap
   // re-probe is fine — ffmpeg refuses fast on a missing path.
   async function verifyVideo() {
-    if (!video?.path) return
-    try {
-      await backend.probeVideo(video.path)
-      if (video.missing) video = { ...video, missing: false }
-    } catch {
-      if (!video.missing) video = { ...video, missing: true }
-    }
+    const results = await Promise.all(
+      videos.map(async (v) => {
+        if (!v.path) return v
+        try {
+          const probe = await backend.probeVideo(v.path)
+          return {
+            ...v,
+            missing: false,
+            hasMotionData: probe.gpmf_stream != null,
+          }
+        } catch {
+          return { ...v, missing: true }
+        }
+      }),
+    )
+    videos = results
   }
 
   async function fetchDefaultOutputDir() {
@@ -1595,17 +1782,35 @@ export function createAppState() {
     set gpxStartTime(v) {
       gpxStartTime = v
     },
+    get videos() {
+      return videos
+    },
+    // The clip under the playhead (what the preview shows), else the first
+    // clip — for UI that needs "the" video.
     get video() {
-      return video
+      return (
+        activeVideoAt(gpxStartTime, videos, selectedSecond) ?? videos[0] ?? null
+      )
+    },
+    get syncingVideos() {
+      return syncingVideos
     },
     get videoUnderlayVisible() {
       return videoUnderlayVisible
     },
     setVideoUnderlayVisible,
     loadVideo,
+    loadVideos,
     pickAndLoadVideo,
-    clearVideo,
+    relinkVideo,
+    removeVideo,
+    clearVideos,
+    setVideoExcluded,
     setVideoOffset,
+    setVideoOffsets,
+    shiftAllVideos,
+    alignVideosToRecordingTime,
+    autoSyncVideos,
     verifyVideo,
     get activityDuration() {
       return activityDuration

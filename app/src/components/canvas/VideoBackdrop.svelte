@@ -16,10 +16,17 @@
    *
    * Hidden whenever the playhead falls outside the video's extent, so
    * the checkered background re-emerges.
+   *
+   * With several clips, the element shows the clip under the playhead; in a
+   * gap between clips it preloads the next one so playback cuts in cleanly.
    */
   import { getContext } from 'svelte'
   import * as backend from '@/api/backend.js'
-  import { videoStartOnAxis as computeStartOnAxis } from '@/lib/videoAlignment.js'
+  import {
+    activeVideoAt,
+    playableVideos,
+    videoStartOnAxis as computeStartOnAxis,
+  } from '@/lib/videoAlignment.js'
 
   let { playing = false } = $props()
 
@@ -28,7 +35,25 @@
   let videoEl = $state(null)
   let videoError = $state(null)
 
-  let video = $derived(app.video)
+  // Clip under the playhead, else the next clip to come (preloaded, hidden).
+  let video = $derived.by(() => {
+    const active = activeVideoAt(
+      app.gpxStartTime,
+      app.videos,
+      app.selectedSecond,
+    )
+    if (active) return active
+    let next = null
+    let nextStart = Infinity
+    for (const v of playableVideos(app.videos)) {
+      const start = computeStartOnAxis(app.gpxStartTime, v)
+      if (start > app.selectedSecond && start < nextStart) {
+        next = v
+        nextStart = start
+      }
+    }
+    return next
+  })
 
   // Resolve to a local HTTP URL served by Rust so WebKitGTK (Linux) gets
   // proper range-request support for seeking. A generation counter prevents
@@ -96,6 +121,13 @@
     }
   })
 
+  // A clip ran out while it was the master clock: step the playhead just past
+  // its end so the timeline clock takes over (and the next clip can cut in).
+  function onEnded() {
+    if (!playing || !video) return
+    app.selectedSecond = endOnAxis + 0.05
+  }
+
   function onVideoError(e) {
     const code = e?.target?.error?.code
     videoError =
@@ -126,6 +158,7 @@
     playsinline
     preload="auto"
     ontimeupdate={onTimeupdate}
+    onended={onEnded}
     onerror={onVideoError}
     class="absolute inset-0 w-full h-full object-contain pointer-events-none rounded-lg"
     style:visibility={inRange ? 'visible' : 'hidden'}

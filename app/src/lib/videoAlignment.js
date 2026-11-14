@@ -52,3 +52,74 @@ export function wallClockApplicable(gpxStartTime, video, activityDuration) {
   const dur = activityDuration ?? 0
   return endAtZero > 0 && startAtZero < dur
 }
+
+/** Clips that can be shown or exported: on disk and with a known duration. */
+export function playableVideos(videos) {
+  return (videos ?? []).filter(
+    (v) => v?.path && !v.missing && (v.duration ?? 0) > 0,
+  )
+}
+
+/**
+ * The clip whose footage covers `second` on the GPX axis, or null. When
+ * clips overlap (two cameras, or a clip nudged onto another), the one that
+ * started most recently wins — it's the footage that "just cut in".
+ */
+export function activeVideoAt(gpxStartTime, videos, second) {
+  let best = null
+  let bestStart = -Infinity
+  for (const v of playableVideos(videos)) {
+    const start = videoStartOnAxis(gpxStartTime, v)
+    if (second >= start && second <= start + v.duration && start > bestStart) {
+      best = v
+      bestStart = start
+    }
+  }
+  return best
+}
+
+/**
+ * Stitched-export plan: every included clip that overlaps the
+ * `start`..`end` export window, in timeline order, trimmed to the window.
+ * Each entry pairs a footage in-point with the activity window it covers.
+ * Slivers shorter than half a second are dropped — they'd be a flash cut.
+ */
+export function exportSegments(gpxStartTime, videos, start, end) {
+  return playableVideos(videos)
+    .filter((v) => !v.excluded)
+    .map((v) => {
+      const vStart = videoStartOnAxis(gpxStartTime, v)
+      const segStart = Math.max(start, vStart)
+      const segEnd = Math.min(end, vStart + v.duration)
+      return {
+        videoPath: v.path,
+        videoIn: segStart - vStart,
+        start: segStart,
+        end: segEnd,
+      }
+    })
+    .filter((s) => s.end - s.start >= 0.5)
+    .sort((a, b) => a.start - b.start)
+}
+
+/**
+ * The camera clock correction shared by every clip placed by wall clock, in
+ * seconds (negative = the camera clock ran fast). Null when no clip has a
+ * timestamp or the clips disagree (moved individually).
+ */
+export function sharedClockOffsetSec(videos) {
+  const timed = (videos ?? []).filter((v) => v?.creationTime)
+  if (timed.length === 0) return null
+  const first = timed[0].userOffsetSec ?? 0
+  return timed.every((v) => (v.userOffsetSec ?? 0) === first) ? first : null
+}
+
+/** "−20m 28s" style label for a clock offset in seconds. */
+export function formatClockOffset(sec) {
+  const s = Math.round(Math.abs(sec))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const r = s % 60
+  const body = h > 0 ? `${h}h ${m}m ${r}s` : m > 0 ? `${m}m ${r}s` : `${r}s`
+  return `${sec < 0 ? '−' : '+'}${body}`
+}

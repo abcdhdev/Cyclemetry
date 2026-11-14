@@ -15,6 +15,14 @@ pub struct VideoProbe {
     pub codec: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// Frame rate of the first video stream as ffmpeg prints it ("59.94").
+    pub fps: Option<String>,
+    /// Whether the container has an audio stream. Multi-clip stitched exports
+    /// pad silent clips with a silent track so the segments concatenate.
+    pub has_audio: bool,
+    /// Stream index of a GoPro GPMF telemetry track (`gpmd`), when present —
+    /// the source of the accelerometer data used for motion auto-sync.
+    pub gpmf_stream: Option<usize>,
 }
 
 /// Shell out to bundled ffmpeg with `-i` and parse the metadata it writes to
@@ -30,7 +38,10 @@ pub fn probe(path: &str) -> Result<VideoProbe, String> {
     Ok(probe)
 }
 
-fn probe_raw(path: &str) -> Result<VideoProbe, String> {
+/// Container metadata exactly as stored, without the GoPro chapter
+/// correction. Callers that only need stream layout (telemetry track index,
+/// audio presence, frame rate) use this to skip the sibling-chapter probes.
+pub fn probe_raw(path: &str) -> Result<VideoProbe, String> {
     if !std::path::Path::new(path).exists() {
         return Err(format!("Video file not found: {path}"));
     }
@@ -57,9 +68,21 @@ fn parse_ffmpeg_metadata(path: &str, stderr: &str) -> Result<VideoProbe, String>
     let mut codec: Option<String> = None;
     let mut width: u32 = 0;
     let mut height: u32 = 0;
+    let mut fps: Option<String> = None;
+    let mut has_audio = false;
+    let mut gpmf_stream: Option<usize> = None;
 
     for raw in stderr.lines() {
         let line = raw.trim_start();
+
+        if line.starts_with("Stream #") {
+            if line.contains(": Audio: ") {
+                has_audio = true;
+            }
+            if gpmf_stream.is_none() && line.contains(": Data: ") && line.contains("gpmd") {
+                gpmf_stream = stream_index(line);
+            }
+        }
 
         if let Some(rest) = line.strip_prefix("Duration:") {
             // "Duration: 00:15:42.50, start: 0.000000, bitrate: ..."
@@ -99,6 +122,7 @@ fn parse_ffmpeg_metadata(path: &str, stderr: &str) -> Result<VideoProbe, String>
                 width = w;
                 height = h;
             }
+            fps = find_fps(rest);
         }
     }
 
@@ -116,7 +140,42 @@ fn parse_ffmpeg_metadata(path: &str, stderr: &str) -> Result<VideoProbe, String>
         codec,
         width,
         height,
+        fps,
+        has_audio,
+        gpmf_stream,
     })
+}
+
+/// `Stream #0:3[0x5](eng): Data: …` → `Some(3)`.
+fn stream_index(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("Stream #")?;
+    let rest = &rest[rest.find(':')? + 1..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// `…, 23.98 fps, 23.98 tbr, …` → `Some("23.98")`.
+fn find_fps(s: &str) -> Option<String> {
+    s.split(',').find_map(|part| {
+        let part = part.trim();
+        let num = part.strip_suffix(" fps")?;
+        num.parse::<f64>().ok().filter(|v| *v > 0.0)?;
+        Some(num.to_string())
+    })
+}
+
+/// ffmpeg's rounded frame-rate text → an exact rational for filters, so
+/// NTSC rates don't drift ("29.97" → "30000/1001").
+pub fn fps_rational(fps: &str) -> String {
+    match fps {
+        "23.98" | "23.976" => "24000/1001".to_string(),
+        "29.97" => "30000/1001".to_string(),
+        "47.95" => "48000/1001".to_string(),
+        "59.94" => "60000/1001".to_string(),
+        "119.88" => "120000/1001".to_string(),
+        "239.76" => "240000/1001".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// GoPro splits long recordings into ~4 GiB chapter files (`GX01aaaa.MP4`,
@@ -247,6 +306,9 @@ mod tests {
             codec: Some("hevc".to_string()),
             width: 3840,
             height: 2160,
+            fps: Some("29.97".to_string()),
+            has_audio: true,
+            gpmf_stream: None,
         }
     }
 
@@ -314,6 +376,35 @@ Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/tmp/clip.mp4':
         assert_eq!(probe.codec.as_deref(), Some("hevc"));
         assert_eq!(probe.width, 3840);
         assert_eq!(probe.height, 2160);
+    }
+
+    const SAMPLE_GOPRO: &str = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'GX010556.MP4':
+  Metadata:
+    creation_time   : 2026-11-14T03:03:16.000000Z
+  Duration: 00:00:03.00, start: 0.000000, bitrate: 7966 kb/s
+  Stream #0:0(eng): Video: hevc (Main) (hvc1 / 0x31637668), yuvj420p(pc, bt709), 3840x2160 [SAR 1:1 DAR 16:9], 7630 kb/s, 23.98 fps, 23.98 tbr, 24k tbn, 23.97 tbc (default)
+  Stream #0:1: Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 191 kb/s (default)
+  Stream #0:2(eng): Data: none (tmcd / 0x64636D74), 0 kb/s (default)
+  Stream #0:3(eng): Data: bin_data (gpmd / 0x646D7067), 54 kb/s (default)
+";
+
+    #[test]
+    fn parses_gopro_streams() {
+        let p = parse_ffmpeg_metadata("/x/GX010556.MP4", SAMPLE_GOPRO).unwrap();
+        assert_eq!(p.fps.as_deref(), Some("23.98"));
+        assert!(p.has_audio);
+        assert_eq!(p.gpmf_stream, Some(3));
+        assert_eq!(fps_rational("23.98"), "24000/1001");
+        assert_eq!(fps_rational("30"), "30");
+    }
+
+    #[test]
+    fn no_audio_no_gpmf() {
+        let p = parse_ffmpeg_metadata("/tmp/clip.mp4", SAMPLE_HEVC).unwrap();
+        assert!(!p.has_audio);
+        assert_eq!(p.gpmf_stream, None);
+        assert_eq!(p.fps.as_deref(), Some("30"));
     }
 
     #[test]

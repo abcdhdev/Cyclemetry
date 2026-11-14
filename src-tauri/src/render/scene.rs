@@ -64,6 +64,34 @@ impl ExportFormat {
 pub struct StitchOptions {
     pub video_path: String,
     pub video_in: f64,
+    /// Set when this render is one segment of a multi-clip export. Segments
+    /// are joined with ffmpeg's concat demuxer without re-encoding, which
+    /// needs every segment to share frame rate, audio layout and time base —
+    /// so footage is normalized to a common frame rate and clips without
+    /// audio get a silent track.
+    pub segment: Option<SegmentFormat>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentFormat {
+    /// Common output frame rate for all segments, as an ffmpeg rational
+    /// ("24000/1001").
+    pub fps: String,
+    /// Whether this segment's source footage has an audio stream.
+    pub source_has_audio: bool,
+}
+
+/// One clip of a multi-clip stitched export: the footage window to use and
+/// the activity window (seconds on the activity axis) overlaid on it.
+#[derive(Debug, Clone)]
+pub struct StitchSegment {
+    pub video_path: String,
+    /// Seconds into the footage file where the segment starts.
+    pub video_in: f64,
+    /// Activity window covered by this segment.
+    pub start: f64,
+    pub end: f64,
+    pub source_has_audio: bool,
 }
 
 pub struct RenderProgress {
@@ -256,28 +284,58 @@ pub fn render_video(
         "-i",
         "-",
     ]);
+    let segment = stitch.and_then(|st| st.segment.as_ref());
+    if let Some(seg) = segment
+        && !seg.source_has_audio
+    {
+        // Input 2: silence, so this segment has the same audio layout as its
+        // neighbours (`-shortest` ends it with the video).
+        cmd.args([
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+        ]);
+    }
     if stitch.is_some() {
         // Composite: footage scaled (letterboxed if aspect differs) to the
         // overlay canvas, cropped overlay placed at its canvas offset on top.
         // The overlay pipe runs at scene fps; `overlay` repeats its last frame
         // between updates, so higher-fps footage keeps its native cadence.
+        // Multi-clip segments are first conformed to the export's common rate.
         let (cw, ch) = ((full_w + 1) & !1, (full_h + 1) & !1);
         let (ox, oy) = crop.as_ref().map_or((0, 0), |c| (c.x, c.y));
+        let conform = segment.map_or(String::new(), |seg| format!("fps={},", seg.fps));
         let filter = format!(
-            "[0:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,\
+            "[0:v]{conform}scale={cw}:{ch}:force_original_aspect_ratio=decrease,\
              pad={cw}:{ch}:-1:-1[bg];[bg][1:v]overlay={ox}:{oy}[out]"
         );
+        let audio_map = match segment {
+            Some(seg) if !seg.source_has_audio => "2:a",
+            Some(_) => "0:a:0",
+            None => "0:a?",
+        };
         cmd.args([
             "-filter_complex",
             &filter,
             "-map",
             "[out]",
             "-map",
-            "0:a?",
+            audio_map,
             "-c:a",
             "aac",
             "-shortest",
         ]);
+        if segment.is_some() {
+            cmd.args([
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-video_track_timescale",
+                "90000",
+            ]);
+        }
     }
     cmd.args(["-c:v", &encoder.codec])
         .args(encoder_output_args(&encoder.codec));
@@ -625,6 +683,166 @@ pub fn render_video(
         }
     }
 
+    Ok(())
+}
+
+/// Multi-clip stitched export: one finished `.mp4` with every clip played back
+/// to back, each carrying the overlay for its own moment of the ride.
+///
+/// Each segment is a regular stitched render (footage trimmed to the segment,
+/// overlay rendered for the matching activity window) written next to the
+/// output; the segments are then joined with ffmpeg's concat demuxer as a
+/// stream copy, so nothing is encoded twice. Progress is reported against the
+/// summed frame count of all segments.
+#[allow(clippy::too_many_arguments)]
+pub fn render_stitched_segments(
+    gpx_path: &str,
+    template: &Template,
+    segments: &[StitchSegment],
+    fps: &str,
+    output_path: &str,
+    fonts_dir: &str,
+    assets_dirs: &[&str],
+    progress: &RenderProgress,
+) -> Result<(), String> {
+    if segments.is_empty() {
+        return Err("Stitched export requires a source video".to_string());
+    }
+    let scene_fps = template.scene.fps.max(1) as f64;
+    let estimated_total: u64 = segments
+        .iter()
+        .map(|s| ((s.end - s.start).max(0.0) * scene_fps).round() as u64)
+        .sum();
+    progress
+        .total_frames
+        .store(estimated_total, Ordering::Relaxed);
+    progress.frames_rendered.store(0, Ordering::Relaxed);
+
+    let out = std::path::Path::new(output_path);
+    let dir = out
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cyclemetry".to_string());
+    let part_paths: Vec<std::path::PathBuf> = (0..segments.len())
+        .map(|i| dir.join(format!(".{stem}.part{:03}.mp4", i + 1)))
+        .collect();
+    let list_path = dir.join(format!(".{stem}.concat.txt"));
+    let cleanup = || {
+        for p in &part_paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(&list_path);
+    };
+
+    let mut done_frames: u64 = 0;
+    for (i, (seg, part)) in segments.iter().zip(&part_paths).enumerate() {
+        if progress.cancelled.load(Ordering::Relaxed) {
+            cleanup();
+            return Err("Render cancelled".to_string());
+        }
+        log::info!(
+            "render_stitched_segments: segment {}/{} {} @ {:.3}s, activity {:.1}..{:.1}",
+            i + 1,
+            segments.len(),
+            seg.video_path,
+            seg.video_in,
+            seg.start,
+            seg.end
+        );
+        let mut seg_template = template.clone();
+        seg_template.scene.start = Some(seg.start);
+        seg_template.scene.end = Some(seg.end);
+        let stitch = StitchOptions {
+            video_path: seg.video_path.clone(),
+            video_in: seg.video_in,
+            segment: Some(SegmentFormat {
+                fps: fps.to_string(),
+                source_has_audio: seg.source_has_audio,
+            }),
+        };
+        // Shares cancel/pause with the outer render; frame counts are its own
+        // and are mirrored into the outer counter by the thread below.
+        let sub = RenderProgress {
+            frames_rendered: Arc::new(AtomicU64::new(0)),
+            total_frames: Arc::new(AtomicU64::new(0)),
+            cancelled: Arc::clone(&progress.cancelled),
+            paused_low_disk: Arc::clone(&progress.paused_low_disk),
+        };
+        let finished = AtomicBool::new(false);
+        let part_str = part.to_string_lossy().into_owned();
+        let result = std::thread::scope(|s| {
+            s.spawn(|| {
+                while !finished.load(Ordering::Relaxed) {
+                    let n = sub.frames_rendered.load(Ordering::Relaxed);
+                    progress
+                        .frames_rendered
+                        .store(done_frames + n, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            });
+            let r = render_video(
+                gpx_path,
+                &seg_template,
+                &part_str,
+                fonts_dir,
+                assets_dirs,
+                ExportFormat::Stitched,
+                Some(&stitch),
+                false,
+                &sub,
+            );
+            finished.store(true, Ordering::Relaxed);
+            r
+        });
+        if let Err(e) = result {
+            cleanup();
+            return Err(if segments.len() > 1 {
+                format!("Clip {} of {}: {e}", i + 1, segments.len())
+            } else {
+                e
+            });
+        }
+        done_frames += sub.frames_rendered.load(Ordering::Relaxed);
+        progress
+            .frames_rendered
+            .store(done_frames, Ordering::Relaxed);
+    }
+    progress.total_frames.store(done_frames, Ordering::Relaxed);
+
+    // Join without re-encoding. Paths are single-quoted per the concat
+    // demuxer's syntax, with embedded quotes escaped.
+    let list: String = part_paths
+        .iter()
+        .map(|p| format!("file '{}'\n", p.to_string_lossy().replace('\'', "'\\''")))
+        .collect();
+    if let Err(e) = std::fs::write(&list_path, list) {
+        cleanup();
+        return Err(format!("Could not write the clip list: {e}"));
+    }
+    let ffmpeg_bin = resolve_ffmpeg();
+    let mut cmd = ffmpeg_command(&ffmpeg_bin);
+    cmd.args(["-loglevel", "error", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list_path)
+        .args(["-map", "0", "-c", "copy", "-movflags", "+faststart", "-y"])
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let joined = cmd.output();
+    cleanup();
+    let joined = joined.map_err(|e| format!("Failed to spawn FFmpeg ({ffmpeg_bin}): {e}"))?;
+    if !joined.status.success() {
+        let _ = std::fs::remove_file(output_path);
+        return Err(format!(
+            "FFmpeg could not join the clips ({}): {}",
+            joined.status,
+            String::from_utf8_lossy(&joined.stderr).trim()
+        ));
+    }
     Ok(())
 }
 

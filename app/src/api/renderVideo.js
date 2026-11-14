@@ -1,6 +1,6 @@
 import * as backend from './backend.js'
 import { exportBitsPerPixelSecond } from '../lib/utils.js'
-import { videoStartOnAxis } from '../lib/videoAlignment.js'
+import { exportSegments, playableVideos } from '../lib/videoAlignment.js'
 
 const ETA_REANCHOR_MS = 30_000
 const ETA_MIN_SAMPLE_SECONDS = 5
@@ -23,29 +23,39 @@ export default async function renderVideo(state) {
 
   const fps = config.scene.fps ?? 30
 
-  // Stitched export: composite the overlay onto the reference video. The
-  // export window is the overlap of the scene range and the video's extent on
-  // the timeline, so the overlay and footage cover the same wall-clock span.
+  // Stitched export: composite the overlay onto the footage. Every included
+  // clip that overlaps the scene range becomes one segment, trimmed to the
+  // overlap; with several clips they're joined back to back into one MP4,
+  // each carrying the overlay for its own stretch of the ride.
   let renderConfig = config
   let renderStart = start
   let renderEnd = end
   let stitch = null
+  let exportSeconds = end - start
   if (exportFormat === 'stitched') {
-    const video = state.video
-    if (!video?.path || video.missing)
-      throw new Error('Stitched export needs a video — load one first')
-    const videoStart = videoStartOnAxis(state.gpxStartTime, video)
-    renderStart = Math.max(start, videoStart)
-    renderEnd = Math.min(end, videoStart + (video.duration ?? 0))
-    if (!(renderEnd > renderStart))
+    const segments = exportSegments(
+      state.gpxStartTime,
+      state.videos,
+      start,
+      end,
+    )
+    if (segments.length === 0)
       throw new Error(
-        'The export range does not overlap the video — adjust the timeline range or move the video on the timeline',
+        playableVideos(state.videos).length === 0
+          ? 'Stitched export needs a video — load one first'
+          : 'The export range does not overlap any included video — adjust the timeline range or move the videos on the timeline',
       )
+    renderStart = segments[0].start
+    renderEnd = segments[segments.length - 1].end
+    exportSeconds = segments.reduce((sum, s) => sum + (s.end - s.start), 0)
     renderConfig = {
       ...config,
       scene: { ...config.scene, start: renderStart, end: renderEnd },
     }
-    stitch = { videoPath: video.path, videoIn: renderStart - videoStart }
+    stitch =
+      segments.length === 1
+        ? { videoPath: segments[0].videoPath, videoIn: segments[0].videoIn }
+        : { segments }
   }
 
   state.renderProgress = {
@@ -170,7 +180,7 @@ export default async function renderVideo(state) {
         outputWidth,
         outputHeight,
         fps,
-        renderEnd - renderStart,
+        exportSeconds,
       )
       state.recordExportSizeEstimate(bitsPerPixelSecond, exportFormat)
     } catch {
